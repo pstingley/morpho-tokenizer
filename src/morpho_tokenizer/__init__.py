@@ -1,0 +1,1 @@
+from .morpho_vdb_tokenizer import MorphoTokenizer
