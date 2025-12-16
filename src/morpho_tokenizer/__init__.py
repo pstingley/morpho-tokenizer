@@ -1,1 +1,2 @@
-from .morpho_vdb_tokenizer import MorphoTokenizer
+from .morpho_vtb_tokenizer import MorphoTokenizer
+__all__ = ["MorphoTokenizer"]
