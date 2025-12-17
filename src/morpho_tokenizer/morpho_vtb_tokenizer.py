@@ -1,33 +1,21 @@
 """
-morpho_vtb_tokenizer.py
-
 Etymology-aware morphological tokenizer using a Viterbi-style DP segmenter.
 
-OPTION 1 IMPLEMENTATION:
-- Adds a root “variant expansion” pass so that lexicon entries like:
-    "laryngologist", "laryngological", "laryngology", ...
-  contribute reusable sub-roots like:
-    "laryng", "laryngo", "logist", "logy", "ology", ...
-  (when detectable by simple patterns)
+This version includes "lexicon-induced root backoff":
 
-This helps segment words like:
-  otolaryngologist  -> oto + laryng + ologist
-  otorhinolaryngologist -> oto + rhino + laryng + ologist
+- Infer additional candidate roots from lexicon entries by:
+  * stripping common suffixes (e.g., -ology, -ologist, -itis, -ectomy, -al, -ic, etc.)
+  * converting combining forms ending in 'o' (e.g., laryngo -> laryng)
+  * optional proto-root projection (adds proto-dict "Root" fields as candidates)
 
-This version keeps the 512-token limit OUT of this module (that belongs in the caller).
+It also adds tunable penalties/bonuses for short roots:
+- short1_adjust: adjustment for 1-character roots (default strongly negative)
+- short2_adjust: adjustment for 2-character roots (default negative)
+- short3_adjust: adjustment for 3-character roots (default negative)
 
-Tunable adjustments:
-- short1_adjust  (≈ [-100, +100]): additive weight for 1-character roots
-- short2_adjust  (≈ [-100, +100]): additive weight for 2-character roots
-- mid_root_adjust (≈ [-100, +100]): additive weight for mid-length roots (e.g., 4–9 chars)
-- long_root_adjust (≈ [-100, +100]): per-character adjustment for length > LONG_ROOT_THRESHOLD (default 7)
-
-These are applied on top of a base root weight derived from frequency and length.
-
-The goal is to favor analyses like:
-    hyperparathyroidism -> hyper + para + thyroid + ism
-rather than many 1–2 character fragments, while still letting you tune behavior
-without editing this module again.
+Goal: prefer analyses like
+    Otolaryngologist -> oto + laryng + ologist
+rather than many 1–3 character fragments.
 """
 
 from __future__ import annotations
@@ -88,11 +76,21 @@ class MorphoTokenizer:
         lambda_penalty: float = 4.5,
         long_unsplit_min_len: int = 5,
         long_unsplit_penalty: float = 3.0,
-        # NEW: tunable adjustments (recommend range [-100, +100])
-        short1_adjust: float = -12.0,  # NEW: strong penalty for 1-char roots by default
-        short2_adjust: float = -5.0,   # penalty/bonus for 2-char roots
-        mid_root_adjust: float = +2.5, # bonus/penalty for mid-length roots (4–9 chars)
-        long_root_adjust: float = -0.5 # per-char adjustment for length > LONG_ROOT_THRESHOLD
+
+        # Tunable adjustments (recommend range [-100, +100])
+        short1_adjust: float = -25.0,  # NEW: 1-char roots (very negative by default)
+        short2_adjust: float = -5.0,   # 2-char roots
+        short3_adjust: float = -2.5,   # NEW: 3-char roots (mild negative default)
+
+        mid_root_adjust: float = +2.5, # mid-length roots (4–9 chars)
+        long_root_adjust: float = -0.5,# per-char adjustment for length > LONG_ROOT_THRESHOLD
+
+        # NEW: lexicon-induced backoff behavior
+        infer_roots_from_lexicon: bool = True,
+        infer_combining_o: bool = True,          # laryngo -> laryng
+        infer_o_prefix_for_logist: bool = True,  # logist -> ologist
+        include_proto_roots: bool = True,        # add proto-dict "Root" fields
+        inferred_root_penalty: float = -0.8,     # slight penalty vs direct lexicon roots
     ) -> None:
         # --- Load surface root lexicon ---
         if lexicon_json is None:
@@ -105,45 +103,34 @@ class MorphoTokenizer:
         else:
             raise TypeError("lexicon_json must be a path or dict.")
 
-        # OPTION 1: expand root lexicon with inferred sub-roots / variants
-        root_dict = self._expand_root_dict_with_variants(root_dict)
-
         self.lexicon_dict: Dict[str, dict] = root_dict
         self.lex = RootLexicon.empty()
 
-        for r in root_dict.keys():
-            if isinstance(r, str) and r.strip():
-                self.lex.roots.add(r.strip().lower())
-
-        # Optional generic suffixes
+        # Optional generic suffixes (used only for scoring suffix pieces, not root inference)
         if add_generic_suffixes:
             generic_suffixes = {
                 "s", "es", "ed", "ing",
                 "ity", "ive", "ize", "ise",
                 "ia", "ism", "ist", "al", "ic", "ous", "ary", "ory", "ship",
                 "tion", "sion", "ment", "ium", "logy", "ology",
-                "ologist", "ological", "ologists",
             }
             self.lex.suffixes |= generic_suffixes
 
         # Weight tables
         self.root_weight: Dict[str, float] = {}
+        self.extra_root_weight: Dict[str, float] = {}  # NEW: inferred roots
         self.prefix_weight: Dict[str, float] = {}
         self.suffix_weight: Dict[str, float] = {}
 
         # Root weights based on NumSourceWords and length (BASE score only)
-        #
-        # Final score used in _score_piece = base_weight + adjustments
-        # where adjustments depend on:
-        #   - length == 1          -> short1_adjust
-        #   - length == 2          -> short2_adjust
-        #   - 4 <= length <= 9     -> mid_root_adjust
-        #   - length > 7           -> long_root_adjust * (length - 7)
-        #
         for r, info in root_dict.items():
             if not isinstance(r, str) or not r.strip():
                 continue
             key = r.strip().lower()
+
+            # keep original lexicon keys as "direct" roots
+            self.lex.roots.add(key)
+
             freq_raw = info.get("NumSourceWords", 1)
             try:
                 freq = int(freq_raw)
@@ -151,24 +138,22 @@ class MorphoTokenizer:
                 freq = 1
 
             L = len(key)
-            # Base weight: frequency + length (mildly pro-longer roots)
             base = 3.0 + math.log1p(max(freq, 1)) + 0.3 * min(L, 8)
             self.root_weight[key] = float(base)
 
         # Simple heuristic suffix weights
         for s in self.lex.suffixes:
-            self.suffix_weight[s] = 3.0 + 0.2 * min(len(s), 10)
+            self.suffix_weight[s] = 3.0 + 0.2 * min(len(s), 6)
 
-        # Prefix weights (empty by default, but you can populate self.lex.prefixes manually)
+        # Prefix weights (empty by default)
         for p in self.lex.prefixes:
-            self.prefix_weight[p] = 2.8 + 0.2 * min(len(p), 10)
+            self.prefix_weight[p] = 2.8 + 0.2 * min(len(p), 6)
 
         # DP / scoring config
         self.UNK_BASE_PENALTY = float(unk_base_penalty)
         self.UNK_PER_CHAR = float(unk_per_char)
         self.MAX_MORPHEME_LEN = int(max_morpheme_len)
 
-        # Global DP behavior
         self.LAMBDA_PENALTY = float(lambda_penalty)
         self.LONG_UNSPLIT_MIN_LEN = int(long_unsplit_min_len)
         self.LONG_UNSPLIT_PENALTY = float(long_unsplit_penalty)
@@ -176,11 +161,19 @@ class MorphoTokenizer:
         # Length-threshold for "long" roots
         self.LONG_ROOT_THRESHOLD = 7
 
-        # NEW: user-tunable adjustments
+        # User-tunable adjustments
         self.SHORT1_ADJUST = float(short1_adjust)
         self.SHORT2_ADJUST = float(short2_adjust)
+        self.SHORT3_ADJUST = float(short3_adjust)
         self.MID_ROOT_ADJUST = float(mid_root_adjust)
         self.LONG_ROOT_ADJUST = float(long_root_adjust)
+
+        # Backoff config
+        self.INFER_ROOTS_FROM_LEXICON = bool(infer_roots_from_lexicon)
+        self.INFER_COMBINING_O = bool(infer_combining_o)
+        self.INFER_O_PREFIX_FOR_LOGIST = bool(infer_o_prefix_for_logist)
+        self.INCLUDE_PROTO_ROOTS = bool(include_proto_roots)
+        self.INFERRED_ROOT_PENALTY = float(inferred_root_penalty)
 
         # Regex for text tokenization
         self._token_split_re = re.compile(r"(\w+|[^\w\s]+)", re.UNICODE)
@@ -200,6 +193,10 @@ class MorphoTokenizer:
 
         self.proto_lexicon_dict: Dict[str, list] = proto_dict
         self.root_to_proto: Dict[str, List[str]] = self._build_root_to_proto_map(proto_dict)
+
+        # NEW: augment candidate roots using lexicon-induced backoff
+        if self.INFER_ROOTS_FROM_LEXICON or self.INCLUDE_PROTO_ROOTS:
+            self._augment_candidate_roots()
 
     # -----------------------------
     # Lexicon loading
@@ -234,7 +231,7 @@ class MorphoTokenizer:
             if not isinstance(entries, list):
                 continue
             for entry in entries:
-                root = entry.get("Root") if isinstance(entry, dict) else None
+                root = entry.get("Root")
                 if not isinstance(root, str) or not root.strip():
                     continue
                 key = root.strip().lower()
@@ -242,112 +239,116 @@ class MorphoTokenizer:
         return mapping
 
     # -----------------------------
-    # OPTION 1: root variant expansion
+    # NEW: Lexicon-induced root backoff
     # -----------------------------
 
-    def _expand_root_dict_with_variants(self, root_dict: Dict[str, dict]) -> Dict[str, dict]:
+    def _augment_candidate_roots(self) -> None:
         """
-        Build a new root_dict that includes:
-          - original keys
-          - inferred reusable roots based on common biomedical affix patterns
+        Add inferred root candidates into self.lex.roots and self.extra_root_weight.
 
-        This is conservative by design: it avoids adding tons of junk, but it will
-        add helpful roots like:
-          laryng   from laryngologist / laryngology / laryngectomy
-          laryngo  from laryngologist / laryngology / laryngological
-          ologist  from laryngologist, otolaryngologist, etc.
-          logy / ology / logical / ological (as roots/suffix-like roots)
+        We infer from:
+          - surface lexicon keys (suffix stripping + combining-form -o removal)
+          - proto lexicon entries (Root fields)
         """
-        out: Dict[str, dict] = dict(root_dict)
-
-        def bump(info: dict, extra_sources: int = 1) -> dict:
-            # shallow copy and bump NumSourceWords a bit so derived roots aren't too weak
-            base = dict(info) if isinstance(info, dict) else {}
-            nsw = base.get("NumSourceWords", 1)
-            try:
-                nsw_i = int(nsw)
-            except Exception:
-                nsw_i = 1
-            base["NumSourceWords"] = max(1, nsw_i) + extra_sources
-            return base
-
-        def add_root(key: str, base_info: dict, extra_sources: int = 1):
-            k = key.strip().lower()
-            if not k:
-                return
-            # do not overwrite a stronger existing entry
-            if k not in out:
-                out[k] = bump(base_info, extra_sources=extra_sources)
-
-        # patterns for splitting common medical/Greek-Latin constructions
+        # A compact, defensible list: common biomedical / technical suffixes
+        # (single-step stripping only, to avoid exploding the candidate set).
         suffixes = [
             "ologist", "ology", "ological", "logist", "logy", "logical",
-            "ectomy", "itis", "emia", "opathy", "phobia", "plasia", "tomy",
+            "ectomy", "itis", "emia", "osis", "iasis",
+            "al", "ial", "ic", "ical", "ous", "ary", "ory",
+            "ism", "ist", "ment", "tion", "sion", "ness",
+            "ize", "ise", "ized", "ising", "izing", "ation",
+            "able", "ible", "ive", "ity",
         ]
 
-        # For every word in the lexicon, infer root candidates by stripping known suffixes
-        for word, info in root_dict.items():
-            if not isinstance(word, str):
-                continue
-            w = word.strip().lower()
-            if len(w) < 6:
-                continue
+        def add_inferred(root: str, base_from: str) -> None:
+            r = root.lower().strip()
+            if not r or len(r) < 3:
+                return
+            if r in self.root_weight or r in self.extra_root_weight:
+                return
 
-            # Strip hyphens and keep a variant too
-            w2 = w.replace("-", "")
-            if w2 != w:
-                add_root(w2, info, extra_sources=1)
+            # derive a base score from the source token if possible
+            src = base_from.lower().strip()
+            src_base = self.root_weight.get(src, 3.0 + 0.3 * min(len(src), 8))
+            # inferred roots get a small penalty (so direct lexicon roots win ties)
+            self.extra_root_weight[r] = float(src_base + self.INFERRED_ROOT_PENALTY)
+            self.lex.roots.add(r)
 
-            for suf in suffixes:
-                if w.endswith(suf) and len(w) > len(suf) + 2:
-                    stem = w[: -len(suf)]
-                    add_root(stem, info, extra_sources=2)
+        # 1) From surface lexicon keys
+        if self.INFER_ROOTS_FROM_LEXICON:
+            for k in list(self.root_weight.keys()):
+                key = k.lower()
 
-                    # also add stem+"o" for "laryng"+"o" => "laryngo" style
-                    if not stem.endswith("o") and len(stem) >= 3:
-                        add_root(stem + "o", info, extra_sources=2)
+                # combining form: laryngo -> laryng
+                if self.INFER_COMBINING_O and len(key) >= 5 and key.endswith("o"):
+                    add_inferred(key[:-1], key)
 
-                    # add the suffix itself as a root candidate too (if useful)
-                    add_root(suf, info, extra_sources=2)
+                # suffix stripping: laryngological -> laryng
+                for suf in suffixes:
+                    if len(key) > len(suf) + 3 and key.endswith(suf):
+                        stem = key[: -len(suf)]
+                        # If stem ends with combining 'o', also drop it (laryngo + logist)
+                        if self.INFER_COMBINING_O and len(stem) >= 5 and stem.endswith("o"):
+                            add_inferred(stem[:-1], key)
+                        add_inferred(stem, key)
 
-        # Also explicitly add a few extremely common biomedical components
-        # (helps even when the lexicon only contains long surface forms)
-        common_components = [
-            "oto", "rhino", "laryng", "laryngo", "logist", "ologist", "logy", "ology",
-        ]
-        for cc in common_components:
-            if cc not in out:
-                out[cc] = {"NumSourceWords": 3}
+                # special: logist -> ologist (helps words like otolaryngologist)
+                if self.INFER_O_PREFIX_FOR_LOGIST and key.endswith("logist") and not key.endswith("ologist"):
+                    add_inferred("o" + key, key)
 
-        return out
+        # 2) From proto-root Root fields
+        if self.INCLUDE_PROTO_ROOTS and self.proto_lexicon_dict:
+            for entries in self.proto_lexicon_dict.values():
+                if not isinstance(entries, list):
+                    continue
+                for entry in entries:
+                    r = entry.get("Root")
+                    if isinstance(r, str) and r.strip():
+                        root = r.strip().lower()
+                        # give proto roots a neutral-ish base score
+                        if root not in self.root_weight and root not in self.extra_root_weight and len(root) >= 3:
+                            self.extra_root_weight[root] = float(3.2 + 0.3 * min(len(root), 8) + self.INFERRED_ROOT_PENALTY)
+                            self.lex.roots.add(root)
 
     # -----------------------------
     # Piece scoring
     # -----------------------------
 
-    def _score_piece(self, p: str) -> Piece:
-        """Score a candidate substring p (lowercased)."""
+    def _score_root(self, p: str) -> Optional[Piece]:
+        """Return a root Piece if p is known as direct or inferred root; else None."""
         if p in self.root_weight:
             score = self.root_weight[p]
-            L = len(p)
+        elif p in self.extra_root_weight:
+            score = self.extra_root_weight[p]
+        else:
+            return None
 
-            # (0) One-character roots: strong penalty knob
-            if L == 1:
-                score += self.SHORT1_ADJUST
+        L = len(p)
 
-            # (1) Two-character roots: global knob SHORT2_ADJUST
-            if L == 2:
-                score += self.SHORT2_ADJUST
+        # Short-root adjustments (explicit knobs)
+        if L == 1:
+            score += self.SHORT1_ADJUST
+        elif L == 2:
+            score += self.SHORT2_ADJUST
+        elif L == 3:
+            score += self.SHORT3_ADJUST
 
-            # (2) Mid-length roots (e.g., biomedical terms): global knob MID_ROOT_ADJUST
-            if 4 <= L <= 9:
-                score += self.MID_ROOT_ADJUST
+        # Mid-length roots bonus/penalty
+        if 4 <= L <= 9:
+            score += self.MID_ROOT_ADJUST
 
-            # (3) Very long roots: penalize or reward beyond length threshold
-            if L > self.LONG_ROOT_THRESHOLD:
-                score += self.LONG_ROOT_ADJUST * (L - self.LONG_ROOT_THRESHOLD)
+        # Very long roots adjustment beyond threshold
+        if L > self.LONG_ROOT_THRESHOLD:
+            score += self.LONG_ROOT_ADJUST * (L - self.LONG_ROOT_THRESHOLD)
 
-            return Piece(p, "root", score)
+        return Piece(p, "root", float(score))
+
+    def _score_piece(self, p: str) -> Piece:
+        """Score a candidate substring p (lowercased)."""
+        root_piece = self._score_root(p)
+        if root_piece is not None:
+            return root_piece
 
         if p in self.suffix_weight:
             return Piece(p, "suffix", self.suffix_weight[p])
